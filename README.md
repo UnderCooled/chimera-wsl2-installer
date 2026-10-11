@@ -49,11 +49,15 @@ If you prefer the terminal path, scroll to [Usage](#usage) below.
    - writes `/etc/wsl.conf` with sensible defaults (`appendWindowsPath=false`
      and `noexec` on `/mnt/c` — see [Hardening](#hardening) below)
    - creates `/etc/hostname`, sets timezone
-   - runs `apk update` then installs `shadow doas bash nano`
+   - runs `apk update` then installs `bash`, `shadow`, and `opendoas` (non-interactively)
    - creates a non-root user in the `wheel` group with `doas`
      (OpenBSD's lighter sudo) wired via `/etc/doas.conf`
+   - with `-Flatpak`: installs `dbus` + `flatpak` + `xdg-desktop-portal-gtk`,
+     starts the D-Bus system bus on every boot via `[boot] command=` (WSL
+     never runs dinit, so dinit boot links are dead here), registers the
+     flathub remote for the new user, and drops a self-heal hook in
+     `/etc/profile.d/wsl-dbus.sh`
 7. Bounces WSL so the default-user setting takes effect
-8. Smoke-tests with `whoami` + `apk --version` + `uname -r`
 
 Re-running the script later reuses the cached tarball if its SHA still
 matches upstream — re-installs after the first run finish in seconds
@@ -95,7 +99,7 @@ Useful parameters:
 | `-Hostname` | `<computer>-chimera` | Written to `/etc/hostname`. |
 | `-Timezone` | `America/New_York` | Symlinks `/etc/localtime`. |
 | `-RootfsBase` | upstream | Mirror URL. Default is `https://repo.chimera-linux.org/live/latest`. |
-| `-Force` | off | Skip the "InstallPath isn't empty" guard and the "already registered" prompt. |
+| `-Flatpak` | off | Install `dbus` + `flatpak` + GTK portal, start the system bus on boot, add flathub for the new user (`--user` scope; system-wide flatpak needs polkit, unavailable here). |
 
 Example: install to a non-system drive, named differently:
 
@@ -103,12 +107,50 @@ Example: install to a non-system drive, named differently:
 .\install.ps1 -DistroName ChimeraDev -InstallPath D:\WSL\chimera-dev
 ```
 
+Example: full install with Flatpak support:
+
+```powershell
+.\install.ps1 -Flatpak
+```
+
+## Development: testing the setup script
+
+`test-setup.ps1` is a dev harness (not needed to install Chimera). It runs
+the *real* in-distro setup/smoke scripts from `install.ps1` — extracted via
+the PowerShell AST, so it is always the shipped code, never a hand-copy —
+against a throwaway `ChimeraTest` distro, so you don't re-download ~200
+packages on every edit. Three tiers, cheapest first:
+
+```powershell
+.\test-setup.ps1 -Show              # seconds, no distro: print the assembled
+                                   # setup/smoke scripts, catch wsl.conf
+                                   # section or placeholder bugs
+.\test-setup.ps1 -Flatpak           # fast: reuse a live ChimeraTest distro
+.\test-setup.ps1 -Flatpak -Fresh    # slow: cold re-import first
+```
+
 ## After install
 
 The installer creates one user (the one you set during the run), in the
-`wheel` group with `doas` enabled. `doas`, `bash`, and `nano` are installed.
-`doas` is OpenBSD's lighter sudo replacement, which Chimera ships by
-default instead of `sudo`. Use it the same way: `doas apk add ...`.
+`wheel` group with `doas` enabled. `bash`, `shadow`, and `opendoas` are
+installed. `doas` (from the `opendoas` package) is OpenBSD's lighter sudo
+replacement, which Chimera ships instead of `sudo`. Use it the same way: `doas apk add ...`.
+
+With `-Flatpak`, the D-Bus system bus starts automatically on every boot
+(via `[boot] command=` in `/etc/wsl.conf`, plus a self-heal hook in
+`/etc/profile.d/wsl-dbus.sh` — needed because WSL boots `/init`, never
+dinit, so dinit service links never run). The flathub remote is registered
+for your user only; install apps with:
+
+```sh
+flatpak --user install flathub <app>   # e.g. flatpak --user install flathub org.gnome.Calculator
+flatpak --user list                    # what you have
+flatpak run <app-id>                   # launch (GUI apps need WSLg, which WSL2 ships)
+```
+
+System-wide flatpak (`flatpak install` without `--user`) is deliberately
+unsupported: it needs `flatpak-system-helper` + polkit, neither of which
+exists in this environment.
 Updates:
 
 ```sh

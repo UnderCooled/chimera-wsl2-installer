@@ -1,4 +1,3 @@
-#Requires -Version 5.1
 <#
 .SYNOPSIS
     Install Chimera Linux as a WSL2 distro (security-hardened).
@@ -15,14 +14,105 @@
       * Distro lookup uses exact match instead of `-match` (no accidental name collisions).
       * `-Force` no longer silently skips `--unregister`; data loss is announced.
       * ext4.vhdx directory is re-ACL'd to "you + SYSTEM only" via icacls.
-      * Supports `-ExpectedSha256` to pin the artifact hash (defends against a
-        compromised upstream: a same-origin sha256sums.txt proves nothing).
+      * `-Flatpak` installs dbus + flatpak, starts the D-Bus system bus on
+        every boot (WSL never runs dinit, so dinit boot links are dead here),
+        and registers the flathub remote for the new user (`--user` scope
+        only: system-wide flatpak needs polkit, which WSL Chimera lacks).
+      * All pipes into native commands (wsl.exe, chpasswd, apk) are byte-exact:
+        PowerShell's CRLF line endings silently corrupted the setup script,
+        `uname -r`, and the user password in earlier revisions.
+
+.PARAMETER DistroName
+    Name the distro is registered under (`wsl --list`). Defaults to 'Chimera'.
+    Must start with a letter or digit, then up to 50 chars of [A-Za-z0-9._ -].
+
+.PARAMETER InstallPath
+    Directory holding the distro's ext4.vhdx. Defaults to C:\WSL\chimera.
+    Prefer a non-system drive (e.g. D:\WSL\chimera): the vhdx only ever grows.
+
+.PARAMETER DownloadDir
+    Where the rootfs tarball is cached. Defaults to C:\WSL\downloads. A cached
+    tarball whose SHA256 still matches upstream is reused, so re-runs skip the
+    ~115 MB download. Safe to delete when disk space matters.
+
+.PARAMETER Username
+    Linux account to create. Defaults to your Windows username, lower-cased.
+    Must start with a lowercase letter, then [a-z0-9_-], max 32 chars.
+    Prompted for interactively at run time regardless of this default.
+
+.PARAMETER Hostname
+    Written to /etc/hostname. Defaults to '<computername>-chimera', lower-cased.
+    Must be a single RFC 1123 label (lowercase alphanumerics and hyphens).
+
+.PARAMETER Timezone
+    Symlinked to /etc/localtime. Defaults to America/New_York. Form is
+    Area/Locality, e.g. Etc/UTC, Europe/Prague.
+
+.PARAMETER RootfsBase
+    Mirror serving the rootfs and sha256sums.txt. Defaults to the official
+    https://repo.chimera-linux.org/live/latest. Must be https://; plaintext
+    HTTP is refused. Override to use a mirror.
+
+.PARAMETER ExpectedSha256
+    Pin the tarball hash (64 hex chars). Upstream's hash is still fetched and
+    compared; on mismatch you are warned and must confirm. A same-origin
+    sha256sums.txt proves nothing against upstream compromise, so verify a
+    pinned hash out-of-band if that threat matters to you.
+
+.PARAMETER Flatpak
+    Install Flatpak support: dbus, flatpak and xdg-desktop-portal-gtk, start the
+    D-Bus system bus on every boot, and register the flathub remote for the
+    new user. Off by default. Only the per-user (`--user`) scope is set up;
+    system-wide Flatpak needs polkit and flatpak-system-helper, which do not
+    exist under WSL. Adds roughly 1 GB to the install.
+
+.PARAMETER SkipAclHardening
+    Do not re-ACL InstallPath to "your account + SYSTEM". Skipping it leaves
+    other local administrators able to read ext4.vhdx, which contains
+    /etc/shadow. Not recommended unless a backup agent needs access.
+
+.PARAMETER Force
+    Bypass two guards: the "InstallPath is not empty" check, and the
+    interactive confirmation before unregistering an existing distro with the
+    same name. Unregistering PERMANENTLY DELETES ext4.vhdx and everything in
+    it, so -Force announces that loudly instead of acting silently.
+
+.EXAMPLE
+    .\install.ps1
+    Default install. Prompts for username and passwords, then downloads,
+    verifies and imports the current Chimera rootfs.
+
+.EXAMPLE
+    .\install.ps1 -Flatpak
+    Install with Flatpak support (flathub available per-user).
+
+.EXAMPLE
+    .\install.ps1 -DistroName ChimeraDev -InstallPath D:\WSL\chimera-dev
+    Install alongside the existing one, on another drive, under another name.
+
+.EXAMPLE
+    .\install.ps1 -ExpectedSha256 c159ce6b8203d3c5e43e73e05cf537d581b78353f6b6f5bf53aef10b46d857da
+    Pin the artifact hash. Your pin wins on upstream mismatch, after confirmation.
+
+.EXAMPLE
+    .\install.ps1 -SkipAclHardening
+    Skip the NTFS ACL lockdown. Only if something else must read the vhdx;
+    note it contains /etc/shadow.
 
 .NOTES
     The user created here is added to `wheel` and granted `permit persist :wheel`
     in /etc/doas.conf, i.e. they can obtain full root. That is by design, but it
     means the user password is effectively a root password.
+
+    With -Flatpak, a second doas rule is added: `permit nopass keepenv root`.
+    It exists only so the installer can drop to the new user without a TTY
+    password prompt. Without -Flatpak you have exactly one rule and no
+    passwordless path.
 #>
+# NOTE: #Requires must come AFTER this comment-based help block, not before
+# it. A leading #Requires makes PowerShell skip the help entirely: `install.ps1 -?`
+# then prints bare syntax instead of the synopsis and parameter list.
+#Requires -Version 5.1
 
 [CmdletBinding()]
 param(
@@ -34,6 +124,7 @@ param(
     [string]$Timezone    = 'America/New_York',
     [string]$RootfsBase  = 'https://repo.chimera-linux.org/live/latest',
     [string]$ExpectedSha256 = '',
+    [switch]$Flatpak,
     [switch]$SkipAclHardening,
     [switch]$Force
 )
@@ -376,6 +467,7 @@ Say "writing /etc/wsl.conf and creating user '$Username'"
 $u  = $Username   # validated above
 $h  = $Hostname   # validated above
 $tz = $Timezone   # validated above
+$flat = if ($Flatpak) { '1' } else { '0' }   # single char, safe to interpolate
 
 $setupScript = @"
 set -e
@@ -383,6 +475,7 @@ echo '--- wsl.conf ---'
 cat > /etc/wsl.conf << 'EOF'
 [boot]
 systemd=false
+__BOOTCMD__
 [user]
 default=$u
 [network]
@@ -409,10 +502,15 @@ mkdir -p /var/spool/mail
 chmod 0775 /var/spool/mail
 
 echo '--- apk ---'
-apk update            || echo 'WARN: apk update failed (no network?)'
-apk add --no-cache bash   || echo 'WARN: could not install bash'
-apk add --no-cache shadow || echo 'WARN: could not install shadow (useradd/chpasswd may be missing)'
-apk add --no-cache doas   || echo 'WARN: could not install doas'
+# NOTE: apk-tools v3 prompts [Y/n] before committing. This script arrives
+# over the same stdin that `sh -s` reads, so a prompt would swallow the
+# rest of the script (symptom: "Do you want to continue [Y/n]?" followed
+# by "Syntax error: end of file unexpected"). --interactive=no proceeds
+# without asking; </dev/null guarantees apk can never drink from the script.
+apk update || echo 'WARN: apk update failed (no network?)'
+apk add --no-cache --interactive=no bash     </dev/null || echo 'WARN: could not install bash'
+apk add --no-cache --interactive=no shadow   </dev/null || echo 'WARN: could not install shadow (useradd/chpasswd may be missing)'
+apk add --no-cache --interactive=no opendoas </dev/null || echo 'WARN: could not install opendoas'
 
 echo '--- user ---'
 if command -v bash >/dev/null 2>&1; then
@@ -423,9 +521,78 @@ fi
 echo 'permit persist :wheel' > /etc/doas.conf
 chmod 0400 /etc/doas.conf
 
+echo '--- flatpak ---'
+if [ "$flat" = '1' ]; then
+    apk add --no-cache --interactive=no dbus              </dev/null || echo 'WARN: could not install dbus'
+    apk add --no-cache --interactive=no dbus-dinit        </dev/null || echo 'WARN: could not install dbus-dinit'
+    apk add --no-cache --interactive=no dbus-dinit-links  </dev/null || echo 'WARN: could not install dbus-dinit-links'
+    apk add --no-cache --interactive=no flatpak           </dev/null || echo 'WARN: could not install flatpak'
+    apk add --no-cache --interactive=no xdg-desktop-portal-gtk </dev/null || echo 'WARN: could not install xdg-desktop-portal-gtk'
+    # WSL boots /init, never dinit, so dinit boot links never run here. The
+    # system bus must be started another way: [boot] command= below runs this
+    # exact one-liner as root on every distro boot; the profile hook repeats
+    # it as a self-heal. Both are gated on the socket so reruns are no-ops.
+    echo 'permit nopass keepenv root' >> /etc/doas.conf
+    # machine-id: flatpak/dbus need one. The live rootfs ships
+    # /var/lib/dbus/machine-id as a symlink to ../../../etc/machine-id, but
+    # never ships the target, so `dbus-uuidgen --ensure` sees a path that
+    # "exists" and silently does nothing. Generate the id explicitly and
+    # repoint the symlink at it.
+    if [ ! -s /etc/machine-id ]; then
+        if dbus-uuidgen > /etc/machine-id 2>/dev/null && [ -s /etc/machine-id ]; then
+            chmod 0444 /etc/machine-id
+            rm -f /var/lib/dbus/machine-id
+            ln -sf /etc/machine-id /var/lib/dbus/machine-id
+        else
+            rm -f /etc/machine-id
+            echo 'WARN: could not create /etc/machine-id'
+        fi
+    fi
+    mkdir -p /run/dbus
+    if [ ! -S /run/dbus/system_bus_socket ]; then
+        dbus-daemon --system --fork --print-pid || echo 'WARN: could not start system bus now (boot hook will retry)'
+    fi
+    # flathub for the new user, user-scope only. Runs via doas (passwordless
+    # for root thanks to the line above), stdin detached so flatpak can never
+    # drink from this script. System-wide remotes need polkit +
+    # flatpak-system-helper, which WSL Chimera has neither of -- not attempted.
+    doas -u '$u' flatpak remote-add --if-not-exists --user flathub \
+        https://dl.flathub.org/repo/flathub.flatpakrepo </dev/null \
+        || echo 'WARN: could not add flathub user remote (retry: flatpak --user remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo)'
+    # Self-heal hook: re-raise the system bus on login if a --shutdown killed
+    # it while the profile was already loaded. Socket-gated no-op otherwise.
+    # No secrets here; keep it that way.
+    cat > /etc/profile.d/wsl-dbus.sh << 'PROFILE_EOF'
+# chimera-wsl2-installer: keep the D-Bus system bus up under WSL, where PID 1
+# is /init and dinit boot links never execute. Cheap, idempotent, silent when
+# the bus is already running.
+if [ ! -S /run/dbus/system_bus_socket ] && [ -x /usr/bin/dbus-daemon ]; then
+    mkdir -p /run/dbus
+    /usr/bin/dbus-daemon --system --fork >/dev/null 2>&1
+fi
+PROFILE_EOF
+    chmod 0644 /etc/profile.d/wsl-dbus.sh
+else
+    echo '(flatpak skipped: reinstall with -Flatpak to enable)'
+fi
+
 echo '--- setup done ---'
 "@
-$setupScript = $setupScript -replace "`r`n", "`n"
+# [boot] command= only exists to raise the system bus (dinit never runs under
+# WSL). Emit it only with -Flatpak: the hook is useless without dbus-daemon,
+# and an unneeded boot command is a failure surface for no benefit.
+if ($Flatpak) {
+    $bootCmd = "command=/bin/sh -c 'if [ ! -S /run/dbus/system_bus_socket ] && [ -x /usr/bin/dbus-daemon ]; then mkdir -p /run/dbus; /usr/bin/dbus-daemon --system --fork; fi'"
+} else {
+    $bootCmd = ''
+}
+$setupScript = $setupScript -replace '__BOOTCMD__', $bootCmd
+# Without -Flatpak the placeholder expands to an empty line inside [boot];
+# INI allows blank lines, so leave it rather than pattern-matching the file.
+# Same trailing-CRLF trap as the smoke test below: PowerShell appends CRLF to
+# the piped string, which would land on the last command as a stray argument.
+# End on a comment so the CR is inert no matter what the last real command is.
+$setupScript += "`n# end"
 
 # `sh -s` reads the program from stdin: nothing is ever written to disk,
 # so there is no password-bearing temp file to leak or to forget to clean up.
@@ -438,11 +605,42 @@ OK 'in-distro setup complete'
 # ---------------------------------------------------------------------------
 function Set-DistroPassword {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '',
-        Justification = 'Password is piped as plaintext to chpasswd over stdin; never interpolated into shell or written to disk.')]
+        Justification = 'Password is written as plaintext to chpasswd stdin; never interpolated into a shell command or written to disk.')]
     param([string]$User, [string]$Password, [string[]]$ExtraArgs)
-    $line = "$User`:$Password"
-    $line | & $WSL -d $DistroName -u root chpasswd @ExtraArgs 2>&1 | Out-Null
-    return $LASTEXITCODE
+
+    # Do NOT use `$line | wsl ...`: PowerShell terminates piped native input
+    # with CRLF, and chpasswd strips only the LF -- the CR becomes part of the
+    # password, so the user can never log in with what they just typed.
+    # Write the exact bytes "user:password\n" to stdin instead. Still no temp
+    # file, still no shell, no argument exposure.
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName  = $WSL
+    # ArgumentList does not exist on .NET Framework (Windows PowerShell 5.1),
+    # so quote into a single argument string. wsl.exe does its own flag parsing
+    # and does NOT accept quoted flags: `"-d"` is treated as the start of the
+    # in-distro command, not an option. Keep flags bare; quote only values
+    # containing whitespace or quotes (DistroName may legally contain spaces).
+    $quoted = @('-d', $DistroName, '-u', 'root', 'chpasswd') + $ExtraArgs |
+              ForEach-Object { if ($_ -match '[\s"]') { '"' + $_.Replace('"', '\"') + '"' } else { $_ } }
+    $psi.Arguments         = $quoted -join ' '
+    $psi.UseShellExecute   = $false
+    $psi.RedirectStandardInput  = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+
+    $proc = [Diagnostics.Process]::Start($psi)
+    try {
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes("$User`:$Password`n")
+        $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+        $proc.StandardInput.BaseStream.Flush()
+        $proc.StandardInput.Close()
+        # Drain both pipes before waiting: a full pipe buffer would deadlock.
+        $null = $proc.StandardOutput.ReadToEnd()
+        $null = $proc.StandardError.ReadToEnd()
+    } finally {
+        $proc.WaitForExit()
+    }
+    return $proc.ExitCode
 }
 
 Say "setting password for '$Username'"
@@ -507,7 +705,24 @@ $smokeScript = @'
 echo "user=$(whoami) uid=$(id -u)"
 echo "apk:"; apk --version 2>&1 | head -1
 echo "kernel:"; uname -r
+__FLATPAK_SMOKE__
 '@
+# PowerShell appends CRLF to the END of a string it pipes to a native command.
+# That would land on the final line as a stray argument (chimerautils' getopt
+# rejects it, e.g. "uname: unrecognized option: "). Placeholders are expanded
+# first, then CRLF is normalized, and a comment terminates the script so the
+# trailing CR always lands somewhere the shell ignores.
+# Flatpak smoke: read-only probes (user remotes + bus socket), no installs.
+if ($Flatpak) {
+    $flatpakSmoke = @'
+echo "flatpak:"; flatpak --user remotes 2>&1
+echo "bus:"; ls /run/dbus/system_bus_socket 2>&1
+'@
+} else {
+    $flatpakSmoke = ''
+}
+$smokeScript = $smokeScript -replace '__FLATPAK_SMOKE__', $flatpakSmoke
+$smokeScript = ($smokeScript -replace "`r`n", "`n") + "`n# end"
 try {
     $smokeScript | & $WSL -d $DistroName sh -s 2>&1 | Out-Host
 } catch {
@@ -524,9 +739,7 @@ Write-Host "  Stage:     $stageFilename"
 Write-Host "  User:      $Username (password you set during install)"
 Write-Host '  Root:      password you set during install'
 Write-Host "  Hostname:  $h"
-Write-Host ''
-Write-Host "  NOTE: '$Username' is in 'wheel' with 'permit persist :wheel' in /etc/doas.conf," -ForegroundColor Yellow
-Write-Host '        i.e. this user can become root. Treat the user password as a root password.' -ForegroundColor Yellow
+if ($Flatpak) { Write-Host '  Flatpak:   enabled (dbus system bus on boot, flathub --user remote)' -ForegroundColor Green }
 Write-Host ''
 Write-Host '  To change passwords later:' -ForegroundColor Yellow
 Write-Host "    wsl -d $DistroName -- passwd"
